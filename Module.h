@@ -4,8 +4,7 @@
 #include <dxgi.h>
 #include <cstdint>
 
-// Pipe
-#define PIPE_NAME    L"\\\\.\\pipe\\fuckoffmaxey"
+#define PIPE_NAME    L"\\\\.\\pipe\\qwleyshade"
 #define PAYLOAD_SIZE 0x40u
 
 //Roblox pointer chain
