@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdarg>
+#include <d3d11.h>
+#include <dxgi.h>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -46,7 +48,7 @@ namespace fm {
         DWORD oldProt = 0;
         if (!VirtualProtect(cell, sizeof(void*), PAGE_READWRITE, &oldProt))
             return false;
-        if (oldFn) *oldFn = vt[slot];
+        if (oldFn && !*oldFn) *oldFn = vt[slot];
         vt[slot] = newFn;
         VirtualProtect(cell, sizeof(void*), oldProt, &oldProt);
         FlushInstructionCache(GetCurrentProcess(), cell, sizeof(void*));
@@ -123,7 +125,7 @@ namespace fm {
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
         case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
-        default:                               return f;
+        default:                              return f;
         }
     }
 
@@ -201,7 +203,7 @@ namespace fm {
         ID3D11Texture2D** ppTex)
     {
         HRESULT hr = g_origCreateTexture2D(self, pDesc, pInitData, ppTex);
-        if (FAILED(hr) || !ppTex || !*ppTex) return hr;
+        if (FAILED(hr) || !ppTex || !*ppTex || !pDesc) return hr;
 
         if (pDesc->Format != DEPTH_FORMAT_EXPECTED)      return hr;
         if (pDesc->BindFlags != DEPTH_BINDFLAG_EXPECTED) return hr;
@@ -314,6 +316,23 @@ namespace fm {
         UINT SyncInterval,
         UINT Flags)
     {
+        if (!self) goto CALL_ORIG;
+
+        // Автоматическое получение ID3D11Device и ID3D11DeviceContext без смещений памяти
+        if (!g_device || g_swapChain != self)
+        {
+            EnterCriticalSection(&g_cs);
+            if (g_context) { g_context->Release(); g_context = nullptr; }
+            if (g_device) { g_device->Release();  g_device = nullptr; }
+
+            g_swapChain = self;
+            if (SUCCEEDED(self->GetDevice(__uuidof(ID3D11Device), (void**)&g_device)) && g_device)
+            {
+                g_device->GetImmediateContext(&g_context);
+            }
+            LeaveCriticalSection(&g_cs);
+        }
+
         if (!g_device || !g_context) goto CALL_ORIG;
 
         if (InterlockedCompareExchange(&g_pipeStarted, 1, 0) == 0)
@@ -500,37 +519,6 @@ namespace fm {
             : S_OK;
     }
 
-    static IDXGISwapChain* resolve_swapchain(HMODULE base)
-    {
-        uintptr_t addr = (uintptr_t)base + OFF_VISUAL_ENGINE_PTR;
-        if (!mem_readable((void*)addr, 8)) return nullptr;
-
-        void* ve = nullptr;
-        if (!safe_read_ptr(&ve, (void*)addr) || !ve) return nullptr;
-
-        void* rv = nullptr;
-        if (!mem_readable((uint8_t*)ve + OFF_VE_TO_RENDER_VIEW, 8)) return nullptr;
-        if (!safe_read_ptr(&rv, (uint8_t*)ve + OFF_VE_TO_RENDER_VIEW) || !rv) return nullptr;
-
-        void* dv = nullptr;
-        if (!mem_readable((uint8_t*)rv + OFF_RV_TO_DEVICE, 8)) return nullptr;
-        if (!safe_read_ptr(&dv, (uint8_t*)rv + OFF_RV_TO_DEVICE) || !dv) return nullptr;
-
-        void* scv = nullptr;
-        if (!mem_readable((uint8_t*)dv + OFF_DEV_TO_SWAPCHAIN, 8)) return nullptr;
-        if (!safe_read_ptr(&scv, (uint8_t*)dv + OFF_DEV_TO_SWAPCHAIN) || !scv) return nullptr;
-
-        IDXGISwapChain* sc = reinterpret_cast<IDXGISwapChain*>(scv);
-        if (!mem_readable(sc, 8)) return nullptr;
-
-        ID3D11Device* testDev = nullptr;
-        HRESULT hr = sc->GetDevice(__uuidof(ID3D11Device), (void**)&testDev);
-        if (FAILED(hr) || !testDev) return nullptr;
-        testDev->Release();
-
-        return sc;
-    }
-
     static bool install_hooks(IDXGISwapChain* sc, ID3D11Device* dev)
     {
         void** scVtbl = vtbl_of(sc);
@@ -539,20 +527,19 @@ namespace fm {
         void* oldP = nullptr;
         void* oldRB = nullptr;
 
-        if (!patch_vtable_slot(scVtbl, VT_PRESENT,
-            (void*)hook_Present, &oldP)) return false;
+        // VMT индексы IDXGISwapChain: Present = 8, ResizeBuffers = 13
+        if (!patch_vtable_slot(scVtbl, 8, (void*)hook_Present, &oldP)) return false;
         g_origPresent = (PFN_Present)oldP;
 
-        if (!patch_vtable_slot(scVtbl, VT_RESIZEBUFFERS,
-            (void*)hook_ResizeBuffers, &oldRB)) return false;
+        if (!patch_vtable_slot(scVtbl, 13, (void*)hook_ResizeBuffers, &oldRB)) return false;
         g_origResizeBuffers = (PFN_ResizeBuffers)oldRB;
 
         void** devVtbl = vtbl_of(dev);
         if (!devVtbl) return false;
 
         void* oldCT2 = nullptr;
-        if (!patch_vtable_slot(devVtbl, VT_CREATETEXTURE2D,
-            (void*)hook_CreateTexture2D, &oldCT2)) return false;
+        // VMT индекс ID3D11Device: CreateTexture2D = 5
+        if (!patch_vtable_slot(devVtbl, 5, (void*)hook_CreateTexture2D, &oldCT2)) return false;
         g_origCreateTexture2D = (PFN_CreateTexture2D)oldCT2;
 
         return true;
@@ -562,6 +549,7 @@ namespace fm {
     {
         InitializeCriticalSection(&g_cs);
 
+        // Ждем загрузки библиотек DX11 и DXGI
         for (int i = 0; i < 200 && InterlockedCompareExchange(&g_running, 0, 0); i++)
         {
             if (GetModuleHandleA("d3d11.dll") && GetModuleHandleA("dxgi.dll")) break;
@@ -569,39 +557,71 @@ namespace fm {
         }
         if (!InterlockedCompareExchange(&g_running, 0, 0)) return 0;
 
-        HMODULE base = GetModuleHandleA(nullptr);
+        // Создаем временное окно для инициализации фиктивного SwapChain
+        WNDCLASSEXA wc = { sizeof(WNDCLASSEXA), CS_CLASSDC, DefWindowProcA, 0L, 0L, GetModuleHandleA(NULL), NULL, NULL, NULL, NULL, "FM_DUMMY", NULL };
+        RegisterClassExA(&wc);
+        HWND hWnd = CreateWindowA("FM_DUMMY", "FM_DUMMY", WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, NULL, NULL, wc.hInstance, NULL);
 
-        IDXGISwapChain* sc = nullptr;
+        DXGI_SWAP_CHAIN_DESC sd = {};
+        sd.BufferCount = 1;
+        sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow = hWnd;
+        sd.SampleDesc.Count = 1;
+        sd.Windowed = TRUE;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-        for (int attempt = 0;
-            attempt < 40 && InterlockedCompareExchange(&g_running, 0, 0) && !sc;
-            attempt++)
+        D3D_FEATURE_LEVEL featureLevel;
+        const D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+
+        IDXGISwapChain* dummySC = nullptr;
+        ID3D11Device* dummyDev = nullptr;
+        ID3D11DeviceContext* dummyCtx = nullptr;
+
+        HRESULT hr = D3D11CreateDeviceAndSwapChain(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            0,
+            featureLevels,
+            2,
+            D3D11_SDK_VERSION,
+            &sd,
+            &dummySC,
+            &dummyDev,
+            &featureLevel,
+            &dummyCtx);
+
+        if (FAILED(hr))
         {
-            sc = resolve_swapchain(base);
-            if (!sc) Sleep(500);
+            hr = D3D11CreateDeviceAndSwapChain(
+                nullptr,
+                D3D_DRIVER_TYPE_WARP,
+                nullptr,
+                0,
+                featureLevels,
+                2,
+                D3D11_SDK_VERSION,
+                &sd,
+                &dummySC,
+                &dummyDev,
+                &featureLevel,
+                &dummyCtx);
         }
 
-        if (!sc) return 0;
-
-        ID3D11Device* dev = nullptr;
-        HRESULT hr = sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev);
-        if (FAILED(hr) || !dev) return 0;
-
-        ID3D11DeviceContext* ctx = nullptr;
-        dev->GetImmediateContext(&ctx);
-        if (!ctx)
+        if (SUCCEEDED(hr) && dummySC && dummyDev)
         {
-            dev->Release();
-            return 0;
+            EnterCriticalSection(&g_cs);
+            install_hooks(dummySC, dummyDev);
+            LeaveCriticalSection(&g_cs);
+
+            dummyCtx->Release();
+            dummySC->Release();
+            dummyDev->Release();
         }
 
-        g_swapChain = sc;
-        g_device = dev;
-        g_context = ctx;
-
-        EnterCriticalSection(&g_cs);
-        install_hooks(sc, dev);
-        LeaveCriticalSection(&g_cs);
+        DestroyWindow(hWnd);
+        UnregisterClassA("FM_DUMMY", wc.hInstance);
 
         return 0;
     }
